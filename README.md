@@ -1,170 +1,298 @@
-# StreamHub — assinaturas de streaming/IPTV licenciado
+# CineVizzo — site de teste automático de 1 hora
 
-Sistema completo para vender assinaturas de **conteúdo audiovisual que você esteja legalmente autorizado a distribuir**. O projeto não inclui listas, canais, filmes, credenciais de terceiros, técnicas para contornar DRM ou fontes não licenciadas.
+Atualização do projeto de vendas e assinaturas com uma página pública que gera testes usando o link do **Painel Slim** (ou outro fornecedor autorizado) sem revelar esse endereço no navegador.
 
-## O que já está implementado
+> Use o projeto somente para um serviço e conteúdos que você tenha autorização para comercializar e distribuir.
 
-- React + Vite, responsivo para celular e computador
-- Cadastro, login e sessão com Supabase Auth
-- Planos mensal, trimestral e anual editáveis
-- Teste automático de 1 hora, limitado a uma utilização por conta
-- Integração Pix PushinPay feita somente no backend
-- Webhook idempotente com validação de token, pagamento, identificador e valor
-- Ativação e renovação automática da assinatura
-- Token de acesso rotativo, armazenado somente como hash
-- Catálogo protegido e links de reprodução temporários com JWT
-- Relatórios de receita, vendas, assinaturas, testes e suporte
-- Chamados de suporte dentro da área do cliente
-- Row Level Security no Supabase
-- Projetos separados para deploy independente na Vercel
+## O que foi adicionado
+
+- Página pública `/teste`
+- Formulário com nome, WhatsApp, e-mail opcional e dispositivo
+- Compatibilidade visual com Android TV, Fire TV Stick, TV Box, celular e computador
+- Chamada da integração externa somente pelo backend Flask
+- Método `POST`, pois o link de chatbot não funciona como uma página comum
+- Modo automático de integração:
+  1. tenta `POST` sem corpo;
+  2. em erro `400`, `415` ou `422`, tenta JSON com nome, telefone e dispositivo
+- Leitura de resposta em JSON ou texto simples
+- Extração automática de usuário, senha, servidor/DNS, link/lista e validade
+- Botões para copiar cada informação
+- Mensagem original do painel preservada para formatos não reconhecidos
+- Bloqueio configurável por WhatsApp e por IP
+- Reserva atômica no Supabase para evitar dois testes simultâneos
+- Registro de sucesso e falha
+- Relatório dos testes no painel administrativo
+- Modo simulado para testar o site sem consumir um teste real
+
+O restante do projeto continua incluído:
+
+- React + Vite responsivo
+- Flask
+- Supabase Auth, banco e RLS
+- PushinPay Pix e webhook
+- Assinaturas e tokens
+- Catálogo protegido
+- Suporte técnico
+- Relatórios administrativos
+- Deploy separado de frontend e backend na Vercel
 
 ## Estrutura
 
 ```text
-streamhub-iptv-legal/
-├── backend/                 API Flask e integração PushinPay
+cinevizzo-testes-painelslim/
+├── backend/
 │   ├── app.py
 │   ├── requirements.txt
 │   ├── vercel.json
 │   └── .env.example
-├── frontend/                React + Vite
+├── frontend/
 │   ├── src/
 │   ├── package.json
 │   ├── vercel.json
 │   └── .env.example
-└── supabase/
-    ├── schema.sql           tabelas, políticas, funções e dados iniciais
-    └── make_admin.sql       transforma um usuário em administrador
+├── supabase/
+│   ├── schema.sql
+│   ├── migration_provider_trials.sql
+│   └── make_admin.sql
+└── README.md
 ```
 
-# Instalação passo a passo
+# Instalação
 
-## 1. Criar o projeto no Supabase
+## 1. Atualizar o Supabase
 
-1. Entre no painel do Supabase e crie um projeto.
-2. Abra **SQL Editor**.
-3. Copie todo o conteúdo de `supabase/schema.sql`.
-4. Execute o SQL.
-5. Em **Authentication > Providers > Email**, mantenha e-mail/senha ativado.
-6. Em **Authentication > URL Configuration**, depois do deploy adicione a URL do frontend em `Site URL` e nas URLs permitidas de redirecionamento.
+### Projeto novo
 
-O SQL cria tabelas, índices, RLS, gatilho de perfil, função atômica de teste e planos iniciais.
-
-## 2. Obter as chaves do Supabase
-
-Em **Project Settings > API**, copie:
-
-- Project URL
-- Publishable/anon key
-- Secret/service role key
-
-A chave secreta é usada apenas no backend. Nunca coloque essa chave no React, em arquivos públicos ou no GitHub.
-
-## 3. Configurar a PushinPay
-
-Você precisa de uma conta aprovada e de um token de API.
-
-O backend usa por padrão:
+No **SQL Editor** do Supabase, execute todo o arquivo:
 
 ```text
-POST https://api.pushinpay.com.br/api/pix/cashIn
+supabase/schema.sql
 ```
 
-Envia:
+### Projeto StreamHub já instalado
+
+Execute apenas:
+
+```text
+supabase/migration_provider_trials.sql
+```
+
+A migração cria:
+
+- tabela `provider_trial_requests`;
+- índices de telefone, IP e status;
+- política RLS de leitura para administradores;
+- função `reserve_provider_trial` para proteção contra repetição.
+
+## 2. Configurar o backend
+
+Na Vercel, abra o projeto do backend e cadastre as variáveis de `backend/.env.example`.
+
+As variáveis novas são:
+
+```env
+TRIAL_PROVIDER_URL=https://painelslim.site/api/chatbot/SEU-CODIGO/SEU-TOKEN
+TRIAL_PROVIDER_METHOD=POST
+TRIAL_PROVIDER_BODY_MODE=auto
+TRIAL_PROVIDER_HEADERS_JSON={}
+TRIAL_PROVIDER_TIMEOUT_SECONDS=30
+TRIAL_PROVIDER_VERIFY_SSL=true
+TRIAL_PROVIDER_MOCK=false
+TRIAL_REQUEST_COOLDOWN_HOURS=720
+TRIAL_IP_COOLDOWN_HOURS=6
+```
+
+### Variável mais importante
+
+Em `TRIAL_PROVIDER_URL`, cole o link que você recebeu do Painel Slim.
+
+**Não coloque esse link:**
+
+- no React;
+- em `VITE_*`;
+- em HTML público;
+- em repositório público do GitHub.
+
+Cadastre-o diretamente em **Vercel > Projeto backend > Settings > Environment Variables**.
+
+## 3. Primeiro teste sem consumir acesso real
+
+No backend use:
+
+```env
+TRIAL_PROVIDER_MOCK=true
+```
+
+Faça deploy e abra:
+
+```text
+https://SEU-FRONTEND.vercel.app/teste
+```
+
+Preencha o formulário. O sistema deve mostrar usuário, senha, servidor e validade de demonstração.
+
+Depois altere para:
+
+```env
+TRIAL_PROVIDER_MOCK=false
+```
+
+Faça novo deploy para usar o Painel Slim.
+
+## 4. Escolher o formato da chamada
+
+Comece com:
+
+```env
+TRIAL_PROVIDER_BODY_MODE=auto
+```
+
+O backend faz:
+
+1. `POST` sem corpo;
+2. se o servidor responder `400`, `415` ou `422`, envia este JSON aproximado:
 
 ```json
 {
-  "value": 2990,
-  "webhook_url": "https://seu-backend.vercel.app/webhooks/pushinpay?...",
-  "split_rules": []
+  "name": "João Silva",
+  "nome": "João Silva",
+  "phone": "5563999999999",
+  "telefone": "5563999999999",
+  "whatsapp": "5563999999999",
+  "email": "cliente@email.com",
+  "device": "android_tv",
+  "dispositivo": "android_tv"
 }
 ```
 
-O valor é enviado em centavos. A URL de webhook é montada automaticamente para cada pedido.
-
-> Se a sua conta PushinPay estiver com lista branca de IP habilitada, verifique a compatibilidade com o IP de saída da Vercel. Funções serverless normalmente não oferecem um único IP fixo sem configuração adicional.
-
-## 4. Publicar o backend na Vercel
-
-1. Envie a pasta completa para um repositório GitHub.
-2. Na Vercel, clique em **Add New > Project**.
-3. Importe o repositório.
-4. Em **Root Directory**, escolha `backend`.
-5. Cadastre as variáveis usando `backend/.env.example` como modelo:
+Também é possível forçar:
 
 ```env
-SUPABASE_URL=https://SEU-PROJETO.supabase.co
-SUPABASE_ANON_KEY=sb_publishable_xxx
-SUPABASE_SERVICE_ROLE_KEY=sb_secret_xxx
-FRONTEND_URL=https://temporario.vercel.app
-PUBLIC_BACKEND_URL=https://seu-backend.vercel.app
-PUSHINPAY_TOKEN=seu-token
-PUSHINPAY_CASHIN_URL=https://api.pushinpay.com.br/api/pix/cashIn
-PUSHINPAY_WEBHOOK_TOKEN=uma-chave-longa-e-aleatoria
-STREAM_SIGNING_SECRET=outra-chave-longa-e-aleatoria
-LICENSED_STREAM_BASE_URL=https://stream.seudominio.com/watch
-TRIAL_DURATION_MINUTES=60
-ACCESS_TOKEN_TTL_MINUTES=5
-PAYMENT_MOCK=false
+TRIAL_PROVIDER_BODY_MODE=empty
 ```
 
-6. Faça o deploy.
-7. Abra `https://seu-backend.vercel.app/health`. Deve retornar `ok: true`.
-8. Atualize `PUBLIC_BACKEND_URL` com a URL definitiva e faça novo deploy.
+ou:
 
-Para gerar segredos fortes localmente:
-
-```bash
-python -c "import secrets; print(secrets.token_urlsafe(48))"
+```env
+TRIAL_PROVIDER_BODY_MODE=json
 ```
 
-## 5. Publicar o frontend na Vercel
+ou:
 
-1. Crie outro projeto na Vercel apontando para o mesmo repositório.
-2. Em **Root Directory**, escolha `frontend`.
-3. O framework será detectado como Vite.
-4. Cadastre:
+```env
+TRIAL_PROVIDER_BODY_MODE=form
+```
+
+Caso o fornecedor exija um cabeçalho, informe como JSON:
+
+```env
+TRIAL_PROVIDER_HEADERS_JSON={"Authorization":"Bearer SEU_TOKEN"}
+```
+
+## 5. Configurar o frontend
+
+No projeto frontend da Vercel:
 
 ```env
 VITE_SUPABASE_URL=https://SEU-PROJETO.supabase.co
 VITE_SUPABASE_ANON_KEY=sb_publishable_xxx
-VITE_API_URL=https://seu-backend.vercel.app
-VITE_APP_NAME=StreamHub
+VITE_API_URL=https://SEU-BACKEND.vercel.app
+VITE_APP_NAME=CineVizzo
+VITE_SUPPORT_WHATSAPP=5563999999999
 ```
 
-5. Faça o deploy.
-6. Copie a URL final do frontend.
-7. Volte ao projeto do backend e altere `FRONTEND_URL` para a URL final.
-8. Faça um novo deploy do backend.
-9. Adicione a URL do frontend nas configurações de URL do Supabase Auth.
+`VITE_SUPPORT_WHATSAPP` é opcional. Use somente números, incluindo `55` e DDD.
 
-## 6. Criar o administrador
+## 6. Deploy na Vercel
 
-1. Cadastre normalmente a conta que será administradora pelo site.
+Use dois projetos apontando para o mesmo repositório.
+
+### Backend
+
+- Root Directory: `backend`
+- Cadastre todas as variáveis do backend
+- Faça deploy
+- Teste `https://SEU-BACKEND.vercel.app/health`
+
+### Frontend
+
+- Root Directory: `frontend`
+- Framework: Vite
+- Cadastre as variáveis `VITE_*`
+- Faça deploy
+
+Depois atualize no backend:
+
+```env
+FRONTEND_URL=https://SEU-FRONTEND.vercel.app
+PUBLIC_BACKEND_URL=https://SEU-BACKEND.vercel.app
+```
+
+Faça novo deploy do backend.
+
+## 7. Criar administrador
+
+1. Cadastre uma conta no site.
 2. Abra `supabase/make_admin.sql`.
-3. Troque `admin@seudominio.com` pelo e-mail cadastrado.
+3. Troque o e-mail de exemplo pelo e-mail cadastrado.
 4. Execute no SQL Editor.
-5. Saia e entre novamente no site.
+5. Saia e entre novamente.
 
-A opção **Administração** aparecerá no menu.
+O painel **Administração** mostrará as solicitações de teste.
 
-## 7. Conectar seu servidor de streaming licenciado
+# Proteção contra testes repetidos
 
-A rota:
+Padrão:
 
-```text
-POST /content/:id/access
+```env
+TRIAL_REQUEST_COOLDOWN_HOURS=720
+TRIAL_IP_COOLDOWN_HOURS=6
 ```
 
-verifica a assinatura e gera um JWT temporário. O backend monta:
+Isso representa:
 
-```text
-LICENSED_STREAM_BASE_URL/PROVIDER_ASSET_ID?token=JWT_TEMPORARIO
+- mesmo WhatsApp: novo teste após 30 dias;
+- mesma conexão/IP: novo teste após 6 horas.
+
+Exemplo para permitir novamente após 7 dias:
+
+```env
+TRIAL_REQUEST_COOLDOWN_HOURS=168
 ```
 
-Seu servidor/CDN precisa validar `STREAM_SIGNING_SECRET`, algoritmo `HS256`, expiração, usuário e identificador do conteúdo. Substitua os itens de demonstração da tabela `content_items` pelos ativos que você tem autorização para distribuir.
+Solicitações com status `failed` podem ser tentadas novamente. Solicitações `processing` ou `success` entram no bloqueio.
 
-Para provedores que usam URLs assinadas próprias, adapte somente a função `content_access()` em `backend/app.py`.
+# Respostas aceitas do painel
+
+O backend entende JSON como:
+
+```json
+{
+  "username": "cliente123",
+  "password": "senha123",
+  "server": "http://servidor.exemplo",
+  "expires_at": "2026-07-04T22:00:00Z",
+  "message": "Teste criado"
+}
+```
+
+Também entende texto como:
+
+```text
+Usuário: cliente123
+Senha: senha123
+Servidor: http://servidor.exemplo
+Validade: 1 hora
+```
+
+Se os nomes forem diferentes, a resposta completa ainda aparecerá na área “Resposta do painel”.
+
+# Rotas novas
+
+| Método | Rota | Função |
+|---|---|---|
+| POST | `/public/trials` | Reserva e gera um teste externo |
+| GET | `/admin/provider-trials` | Lista os testes para administradores |
 
 # Execução local
 
@@ -193,8 +321,6 @@ cp .env.example .env
 python app.py
 ```
 
-API local: `http://localhost:5000`
-
 ## Frontend
 
 ```bash
@@ -204,58 +330,21 @@ cp .env.example .env.local
 npm run dev
 ```
 
-Frontend local: `http://localhost:5173`
+Acesse `http://localhost:5173/teste`.
 
-# Testar sem cobrar Pix real
+# Observação importante sobre a integração fornecida
 
-No backend, use:
+Foi possível confirmar que o endereço informado não aceita uma abertura normal por `GET`. Como não foi possível disparar um `POST` real sem criar/consumir um teste da sua conta, o projeto utiliza um adaptador configurável e modo simulado. Depois do deploy, faça primeiro um teste controlado. Se o fornecedor usar um corpo diferente, altere apenas `call_trial_provider()` em `backend/app.py` ou ajuste o modo de corpo pelas variáveis acima.
 
-```env
-PAYMENT_MOCK=true
+## Correção: `column "paid_at" does not exist`
+
+Esse erro acontece quando o projeto Supabase já possuía uma tabela `public.payments` criada por outro sistema. O comando `create table if not exists` preserva a tabela antiga e não acrescenta automaticamente colunas novas.
+
+No SQL Editor, execute primeiro:
+
+```sql
+alter table public.payments
+  add column if not exists paid_at timestamptz;
 ```
 
-Gere uma cobrança pelo painel. Depois simule a confirmação substituindo os valores:
-
-```bash
-curl -X POST "http://localhost:5000/webhooks/pushinpay?token=SEU_WEBHOOK_TOKEN&payment_id=UUID_DO_PAGAMENTO" \
-  -H "Content-Type: application/json" \
-  -d '{"status":"paid","transaction_id":"mock_TRANSACAO","value":2990}'
-```
-
-No modo mock, o identificador enviado no webhook deve ser o mesmo mostrado em `provider_transaction_id` no registro da tabela `payments`. Somente em `PAYMENT_MOCK=true` o campo pode ser omitido. Em produção, o backend exige que o identificador recebido confira com a cobrança criada.
-
-# Rotas principais
-
-| Método | Rota | Função |
-|---|---|---|
-| GET | `/health` | saúde da API |
-| GET | `/plans` | lista pública de planos |
-| GET | `/me` | perfil e assinatura atual |
-| POST | `/trial` | cria teste único de 1 hora |
-| POST | `/payments/pix` | cria cobrança PushinPay |
-| GET | `/payments/:id` | consulta pagamento do usuário |
-| POST | `/webhooks/pushinpay` | confirmação e ativação automática |
-| POST | `/access-token/rotate` | revoga e gera novo token |
-| POST | `/access-token/validate` | valida token para integração externa |
-| GET | `/content` | catálogo protegido |
-| POST | `/content/:id/access` | link temporário de reprodução |
-| GET/POST | `/support/tickets` | chamados do cliente |
-| GET | `/admin/summary` | indicadores administrativos |
-| GET | `/admin/payments` | últimas vendas |
-| GET | `/admin/usage` | estatísticas de uso por evento e dia |
-| GET/PATCH | `/admin/tickets` | gestão de suporte |
-
-# Ajustes recomendados antes de produção
-
-- Troque nome, textos, cores, logotipo e valores dos planos.
-- Configure domínio próprio e HTTPS.
-- Ative confirmação de e-mail e proteção contra abuso no Supabase Auth.
-- Configure logs e alertas na Vercel.
-- Confirme no painel/documentação da sua conta PushinPay os nomes exatos enviados no webhook. O conector já aceita variações comuns, mas provedores podem alterar versões e formatos.
-- Crie política de privacidade, termos de uso, política de reembolso e identificação empresarial.
-- Faça revisão jurídica dos direitos de distribuição e da LGPD.
-- Não armazene senha de painel IPTV, lista M3U ou credenciais de terceiros no navegador.
-
-# Observação sobre “ativação IPTV”
-
-Este projeto ativa a assinatura dentro do Supabase e libera acesso protegido ao conteúdo. Caso você possua um painel autorizado de gestão de assinantes, crie um adaptador servidor-a-servidor dentro de `activate_subscription()` usando a API oficial desse fornecedor. Nunca exponha a credencial desse painel no frontend.
+Depois execute novamente `supabase/schema.sql` inteiro. O arquivo corrigido também já contém essa compatibilidade. Como alternativa, execute `supabase/fix_paid_at.sql`.

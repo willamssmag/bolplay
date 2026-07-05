@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from functools import wraps
@@ -40,6 +41,17 @@ LICENSED_STREAM_BASE_URL = env("LICENSED_STREAM_BASE_URL", "https://stream.examp
 TRIAL_DURATION_MINUTES = int(env("TRIAL_DURATION_MINUTES", "60"))
 ACCESS_TOKEN_TTL_MINUTES = int(env("ACCESS_TOKEN_TTL_MINUTES", "5"))
 PAYMENT_MOCK = env("PAYMENT_MOCK", "false").lower() == "true"
+
+# Integração do gerador de teste externo (Painel Slim ou outro provedor autorizado).
+TRIAL_PROVIDER_URL = env("TRIAL_PROVIDER_URL")
+TRIAL_PROVIDER_METHOD = env("TRIAL_PROVIDER_METHOD", "POST").upper()
+TRIAL_PROVIDER_BODY_MODE = env("TRIAL_PROVIDER_BODY_MODE", "auto").lower()
+TRIAL_PROVIDER_HEADERS_JSON = env("TRIAL_PROVIDER_HEADERS_JSON", "{}")
+TRIAL_PROVIDER_TIMEOUT_SECONDS = int(env("TRIAL_PROVIDER_TIMEOUT_SECONDS", "30"))
+TRIAL_PROVIDER_VERIFY_SSL = env("TRIAL_PROVIDER_VERIFY_SSL", "true").lower() == "true"
+TRIAL_PROVIDER_MOCK = env("TRIAL_PROVIDER_MOCK", "false").lower() == "true"
+TRIAL_REQUEST_COOLDOWN_HOURS = int(env("TRIAL_REQUEST_COOLDOWN_HOURS", "720"))
+TRIAL_IP_COOLDOWN_HOURS = int(env("TRIAL_IP_COOLDOWN_HOURS", "6"))
 
 app = Flask(__name__)
 CORS(
@@ -299,9 +311,173 @@ def audit_event(user_id: str | None, event_type: str, metadata: dict | None = No
         pass
 
 
+def normalize_phone(value: Any) -> str:
+    digits = re.sub(r"\D+", "", str(value or ""))
+    if digits.startswith("0"):
+        digits = digits.lstrip("0")
+    if len(digits) in {10, 11}:
+        digits = "55" + digits
+    return digits[:15]
+
+
+def mask_phone(value: str) -> str:
+    digits = normalize_phone(value)
+    if len(digits) < 8:
+        return "***"
+    return f"+{digits[:2]} ({digits[2:4]}) *****-{digits[-4:]}"
+
+
+def parse_provider_headers() -> dict[str, str]:
+    try:
+        raw = json.loads(TRIAL_PROVIDER_HEADERS_JSON or "{}")
+        if not isinstance(raw, dict):
+            return {}
+        return {clean_text(k, 120): clean_text(v, 600) for k, v in raw.items() if k and v}
+    except Exception:
+        return {}
+
+
+def response_to_payload(response: requests.Response) -> tuple[Any, str]:
+    text = response.text[:20000]
+    try:
+        payload = response.json()
+        return payload, text
+    except ValueError:
+        return text, text
+
+
+def recursive_value(payload: Any, names: tuple[str, ...]) -> Any:
+    wanted = {name.lower() for name in names}
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if str(key).lower() in wanted and value not in (None, ""):
+                return value
+        for value in payload.values():
+            found = recursive_value(value, names)
+            if found not in (None, ""):
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = recursive_value(value, names)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def regex_field(text: str, labels: tuple[str, ...]) -> str | None:
+    joined = "|".join(re.escape(label) for label in labels)
+    patterns = [
+        rf"(?im)^\s*(?:{joined})\s*[:=\-]\s*([^\r\n]+)",
+        rf"(?i)(?:{joined})\s*[:=\-]\s*([^|;,\r\n]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return clean_text(match.group(1), 1000)
+    return None
+
+
+def normalize_trial_result(payload: Any, raw_text: str) -> dict:
+    text = raw_text or (json.dumps(payload, ensure_ascii=False) if isinstance(payload, (dict, list)) else str(payload or ""))
+    username = recursive_value(payload, ("username", "user", "usuario", "login")) if isinstance(payload, (dict, list)) else None
+    password = recursive_value(payload, ("password", "pass", "senha")) if isinstance(payload, (dict, list)) else None
+    server = recursive_value(payload, ("server", "host", "dns", "servidor", "base_url", "baseUrl")) if isinstance(payload, (dict, list)) else None
+    playlist = recursive_value(payload, ("m3u", "m3u_url", "m3uUrl", "playlist", "playlist_url", "url")) if isinstance(payload, (dict, list)) else None
+    expires_at = recursive_value(payload, ("expires_at", "expiresAt", "expiration", "valid_until", "validade", "expira")) if isinstance(payload, (dict, list)) else None
+    message = recursive_value(payload, ("message", "mensagem", "response", "resposta", "data")) if isinstance(payload, dict) else None
+
+    username = clean_text(username or regex_field(text, ("usuário", "usuario", "user", "login")), 500) or None
+    password = clean_text(password or regex_field(text, ("senha", "password", "pass")), 500) or None
+    server = clean_text(server or regex_field(text, ("servidor", "server", "host", "dns")), 1000) or None
+    playlist = clean_text(playlist or regex_field(text, ("url m3u", "m3u", "playlist", "lista", "link")), 2000) or None
+    expires_at = clean_text(expires_at or regex_field(text, ("validade", "expira", "expiração", "expiration", "expires")), 500) or None
+    if isinstance(message, (dict, list)):
+        message = json.dumps(message, ensure_ascii=False)
+    message = clean_text(message or text, 12000)
+
+    return {
+        "username": username,
+        "password": password,
+        "server": server,
+        "playlist_url": playlist,
+        "expires_at": expires_at,
+        "message": message,
+    }
+
+
+def call_trial_provider(customer: dict) -> tuple[dict, dict]:
+    if TRIAL_PROVIDER_MOCK:
+        payload = {
+            "message": "Teste de demonstração criado com sucesso.",
+            "username": "demo" + secrets.token_hex(3),
+            "password": secrets.token_urlsafe(6),
+            "server": "http://demo.exemplo.com",
+            "expires_at": iso(utcnow() + timedelta(minutes=60)),
+        }
+        return normalize_trial_result(payload, json.dumps(payload, ensure_ascii=False)), payload
+
+    if not TRIAL_PROVIDER_URL:
+        raise RuntimeError("TRIAL_PROVIDER_URL não configurada no backend.")
+
+    headers = {"Accept": "application/json, text/plain, */*", "User-Agent": "CineVizzo-Trial-Gateway/1.0"}
+    headers.update(parse_provider_headers())
+    common_payload = {
+        "name": customer.get("name"),
+        "nome": customer.get("name"),
+        "phone": customer.get("phone"),
+        "telefone": customer.get("phone"),
+        "whatsapp": customer.get("phone"),
+        "email": customer.get("email"),
+        "device": customer.get("device"),
+        "dispositivo": customer.get("device"),
+    }
+
+    attempts: list[tuple[str, dict]]
+    if TRIAL_PROVIDER_BODY_MODE == "empty":
+        attempts = [("empty", {})]
+    elif TRIAL_PROVIDER_BODY_MODE == "json":
+        attempts = [("json", {"json": common_payload})]
+    elif TRIAL_PROVIDER_BODY_MODE == "form":
+        attempts = [("form", {"data": common_payload})]
+    else:
+        # O link usado pelo chatbot costuma aceitar POST sem corpo. Se o provedor
+        # exigir dados do contato, a segunda tentativa usa um JSON com aliases comuns.
+        attempts = [("empty", {}), ("json", {"json": common_payload})]
+
+    last_error = "O provedor não respondeu."
+    for mode, kwargs in attempts:
+        try:
+            response = requests.request(
+                TRIAL_PROVIDER_METHOD,
+                TRIAL_PROVIDER_URL,
+                headers=headers,
+                timeout=TRIAL_PROVIDER_TIMEOUT_SECONDS,
+                verify=TRIAL_PROVIDER_VERIFY_SSL,
+                **kwargs,
+            )
+        except requests.RequestException as exc:
+            last_error = f"Falha ao conectar ao provedor: {exc}"
+            continue
+        payload, raw_text = response_to_payload(response)
+        if 200 <= response.status_code < 300:
+            normalized = normalize_trial_result(payload, raw_text)
+            return normalized, {
+                "status_code": response.status_code,
+                "body_mode": mode,
+                "payload": payload if isinstance(payload, (dict, list)) else raw_text[:12000],
+            }
+        error_message = None
+        if isinstance(payload, dict):
+            error_message = payload.get("message") or payload.get("error")
+        last_error = clean_text(error_message or raw_text or f"HTTP {response.status_code}", 1000)
+        if response.status_code not in {400, 415, 422}:
+            break
+    raise RuntimeError(last_error)
+
+
 @app.get("/")
 def root():
-    return jsonify({"service": "StreamHub API", "status": "online", "legal_use": "licensed-content-only"})
+    return jsonify({"service": "CineVizzo API", "status": "online", "legal_use": "licensed-content-only"})
 
 
 @app.get("/health")
@@ -328,6 +504,87 @@ def me():
             "subscription": current_subscription(user_id),
         }
     )
+
+
+@app.post("/public/trials")
+def create_public_provider_trial():
+    body = request.get_json(silent=True) or {}
+    name = clean_text(body.get("name"), 120)
+    phone = normalize_phone(body.get("phone"))
+    email = clean_text(body.get("email"), 180).lower()
+    device = clean_text(body.get("device"), 80)
+    accepted = bool(body.get("accepted_terms"))
+    honeypot = clean_text(body.get("company"), 100)
+
+    if honeypot:
+        return json_error("Solicitação inválida.", 400)
+    if len(name) < 2:
+        return json_error("Informe seu nome.")
+    if len(phone) < 12:
+        return json_error("Informe um WhatsApp válido com DDD.")
+    if device not in {"android_tv", "fire_tv", "tv_box", "smartphone", "computador", "outro"}:
+        return json_error("Selecione o dispositivo.")
+    if not accepted:
+        return json_error("Você precisa aceitar os termos do teste.")
+
+    ip_value = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    phone_digest = token_hash(phone)
+    ip_digest = token_hash(ip_value)
+
+    try:
+        reserved = supabase.rpc(
+            "reserve_provider_trial",
+            {
+                "p_name": name,
+                "p_phone": phone,
+                "p_email": email or None,
+                "p_device": device,
+                "p_phone_hash": phone_digest,
+                "p_ip_hash": ip_digest,
+                "p_cooldown_hours": TRIAL_REQUEST_COOLDOWN_HOURS,
+                "p_ip_cooldown_hours": TRIAL_IP_COOLDOWN_HOURS,
+            },
+        ).execute()
+    except Exception as exc:
+        text = str(exc).lower()
+        if "trial_phone_cooldown" in text:
+            return json_error("Este WhatsApp já recebeu um teste recentemente.", 409)
+        if "trial_ip_cooldown" in text:
+            return json_error("Já foi gerado um teste recentemente nesta conexão.", 409)
+        app.logger.exception(exc)
+        return json_error("Não foi possível registrar a solicitação.", 500)
+
+    row = first(reserved.data)
+    if not row or not row.get("request_id"):
+        return json_error("Não foi possível reservar o teste.", 500)
+    request_id = row["request_id"]
+
+    try:
+        result, provider_meta = call_trial_provider({"name": name, "phone": phone, "email": email, "device": device})
+        supabase.table("provider_trial_requests").update(
+            {
+                "status": "success",
+                "result_data": result,
+                "provider_response": provider_meta,
+                "completed_at": iso(utcnow()),
+            }
+        ).eq("id", request_id).execute()
+        audit_event(None, "provider_trial_success", {"request_id": request_id, "device": device})
+        return jsonify(
+            {
+                "message": "Teste gerado com sucesso.",
+                "request_id": request_id,
+                "customer": {"name": name, "phone_masked": mask_phone(phone), "device": device},
+                "trial": result,
+            }
+        ), 201
+    except Exception as exc:
+        message = clean_text(str(exc), 1000) or "Falha desconhecida no provedor."
+        supabase.table("provider_trial_requests").update(
+            {"status": "failed", "error_message": message, "completed_at": iso(utcnow())}
+        ).eq("id", request_id).execute()
+        audit_event(None, "provider_trial_failed", {"request_id": request_id, "device": device})
+        return json_error(f"O teste não foi gerado: {message}", 502)
 
 
 @app.post("/trial")
@@ -646,6 +903,7 @@ def admin_summary():
     ).execute()
     trials = supabase.table("trial_claims").select("id", count="exact").gte("claimed_at", since).execute()
     tickets = supabase.table("support_tickets").select("id", count="exact").eq("status", "open").execute()
+    provider_trials = (supabase.table("provider_trial_requests").select("id", count="exact").eq("status", "success").gte("created_at", since).execute())
     usage = supabase.table("usage_events").select("id", count="exact").gte("created_at", since).execute()
     content_starts = (
         supabase.table("usage_events")
@@ -661,6 +919,7 @@ def admin_summary():
             "gross_revenue_cents": sum(int(x.get("amount_cents") or 0) for x in paid),
             "active_subscriptions": active.count or 0,
             "trials_started": trials.count or 0,
+            "provider_trials_success": provider_trials.count or 0,
             "open_tickets": tickets.count or 0,
             "usage_events": usage.count or 0,
             "content_starts": content_starts.count or 0,
@@ -713,6 +972,27 @@ def admin_payments():
         .execute()
     )
     return jsonify({"payments": result.data or []})
+
+
+@app.get("/admin/provider-trials")
+@require_admin
+def admin_provider_trials():
+    result = (
+        supabase.table("provider_trial_requests")
+        .select("id,name,phone,email,device,status,result_data,error_message,created_at,completed_at")
+        .order("created_at", desc=True)
+        .limit(150)
+        .execute()
+    )
+    rows = result.data or []
+    for row in rows:
+        row["phone_masked"] = mask_phone(row.get("phone") or "")
+        row.pop("phone", None)
+        data = row.get("result_data") or {}
+        if isinstance(data, dict) and data.get("password"):
+            data = {**data, "password": "••••••••"}
+            row["result_data"] = data
+    return jsonify({"trials": rows})
 
 
 @app.get("/admin/tickets")
