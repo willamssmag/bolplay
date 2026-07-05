@@ -348,3 +348,16 @@ alter table public.payments
 ```
 
 Depois execute novamente `supabase/schema.sql` inteiro. O arquivo corrigido também já contém essa compatibilidade. Como alternativa, execute `supabase/fix_paid_at.sql`.
+
+# Correção para erro de instalação na Vercel
+
+Se aparecer `npm error Exit handler never called`, use os arquivos desta versão e confirme no projeto frontend:
+
+- Root Directory: `frontend`
+- Framework: `Vite`
+- Install Command: `npm install`
+- Build Command: `npm run build`
+- Output Directory: `dist`
+- Node.js: `22.x`
+
+Em seguida faça um redeploy sem reutilizar o cache. Consulte `DEPLOY-VERCEL.md`.
