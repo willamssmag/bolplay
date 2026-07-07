@@ -34,12 +34,20 @@ SUPABASE_SERVICE_ROLE_KEY = env("SUPABASE_SERVICE_ROLE_KEY", required=True)
 FRONTEND_URL = env("FRONTEND_URL", "http://localhost:5173")
 PUBLIC_BACKEND_URL = env("PUBLIC_BACKEND_URL", "http://localhost:5000").rstrip("/")
 PUSHINPAY_TOKEN = env("PUSHINPAY_TOKEN")
-PUSHINPAY_CASHIN_URL = env("PUSHINPAY_CASHIN_URL", "https://api.pushinpay.com.br/api/pix/cashIn")
+PUSHINPAY_CASHIN_URL = env(
+    "PUSHINPAY_CASHIN_URL",
+    "https://api.pushinpay.com.br/api/pix/cashIn",
+)
 PUSHINPAY_TRANSACTION_URL = env(
     "PUSHINPAY_TRANSACTION_URL",
     "https://api.pushinpay.com.br/api/transactions/{id}",
 )
+PUSHINPAY_STATUS_SYNC_SECONDS = max(
+    int(env("PUSHINPAY_STATUS_SYNC_SECONDS", "60")),
+    60,
+)
 PUSHINPAY_WEBHOOK_TOKEN = env("PUSHINPAY_WEBHOOK_TOKEN", required=True)
+APP_VERSION = "2026-07-07-pushinpay-sync-v3"
 STREAM_SIGNING_SECRET = env("STREAM_SIGNING_SECRET", required=True)
 LICENSED_STREAM_BASE_URL = env("LICENSED_STREAM_BASE_URL", "https://stream.example.com/watch").rstrip("/")
 TRIAL_DURATION_MINUTES = int(env("TRIAL_DURATION_MINUTES", "60"))
@@ -177,62 +185,60 @@ def current_subscription(user_id: str) -> dict | None:
 
 
 def activate_subscription(payment: dict) -> dict:
-    """Ativa ou renova uma assinatura de forma idempotente por pagamento."""
+    """Ativa ou renova uma assinatura sem duplicar o mesmo pagamento."""
     user_id = payment["user_id"]
     payment_id = payment["id"]
 
-    # Webhooks podem ser reenviados. Se este pagamento já ativou uma
-    # assinatura, devolvemos o mesmo registro sem acrescentar novos dias.
-    existing_for_payment = db_one(
+    already_linked = db_one(
         supabase.table("subscriptions")
         .select("*, plans(name, slug, duration_days)")
         .eq("payment_id", payment_id)
-        .eq("user_id", user_id)
     )
-    if existing_for_payment:
-        return existing_for_payment
+    if already_linked:
+        return already_linked
 
-    plan = db_one(supabase.table("plans").select("*").eq("id", payment["plan_id"]))
+    plan = db_one(
+        supabase.table("plans")
+        .select("*")
+        .eq("id", payment["plan_id"])
+    )
     if not plan:
         raise RuntimeError("Plano não encontrado para ativação.")
 
     now = utcnow()
-    existing = current_subscription(user_id)
-    renewal_base = now
-    starts_at = now
-
-    if existing:
+    current = current_subscription(user_id)
+    start = now
+    if current:
         try:
-            existing_end = datetime.fromisoformat(
-                str(existing["ends_at"]).replace("Z", "+00:00")
+            current_end = datetime.fromisoformat(
+                current["ends_at"].replace("Z", "+00:00")
             )
-            renewal_base = max(now, existing_end)
-            existing_start = existing.get("starts_at")
-            if existing_start:
-                starts_at = datetime.fromisoformat(
-                    str(existing_start).replace("Z", "+00:00")
-                )
-        except (TypeError, ValueError):
-            renewal_base = now
-            starts_at = now
+            start = max(now, current_end)
+        except Exception:
+            start = now
 
-    end = renewal_base + timedelta(days=int(plan["duration_days"]))
-
+    end = start + timedelta(days=int(plan["duration_days"]))
     payload = {
         "user_id": user_id,
         "plan_id": plan["id"],
         "payment_id": payment_id,
         "status": "active",
-        "starts_at": iso(starts_at),
+        "starts_at": iso(start),
         "ends_at": iso(end),
         "updated_at": iso(now),
         "is_trial": False,
     }
 
     existing_any = db_one(
-        supabase.table("subscriptions").select("id").eq("user_id", user_id)
+        supabase.table("subscriptions")
+        .select("*")
+        .eq("user_id", user_id)
+        .order("updated_at", desc=True)
     )
+
     if existing_any:
+        if existing_any.get("payment_id") == payment_id:
+            return existing_any
         result = (
             supabase.table("subscriptions")
             .update(payload)
@@ -248,7 +254,6 @@ def activate_subscription(payment: dict) -> dict:
             supabase.table("subscriptions")
             .select("*, plans(name, slug, duration_days)")
             .eq("payment_id", payment_id)
-            .eq("user_id", user_id)
         )
     return subscription or payload
 
@@ -339,20 +344,67 @@ def create_pushinpay_charge(payment_id: str, value_cents: int) -> dict:
     return normalize_pushinpay_response(payload)
 
 
-def fetch_pushinpay_transaction(provider_transaction_id: str) -> dict:
-    """Consulta a transação diretamente na PushinPay.
+PAID_PROVIDER_STATUSES = {
+    "paid",
+    "approved",
+    "completed",
+    "confirmed",
+    "pix_paid",
+    "payment.paid",
+}
 
-    Alguns webhooks podem chegar sem corpo JSON. Nessa situação, o ID da
-    transação salvo ao criar o PIX é usado para consultar o status real.
-    """
+PROVIDER_STATUS_MAP = {
+    "created": "pending",
+    "pending": "pending",
+    "waiting": "pending",
+    "processing": "processing",
+    "failed": "failed",
+    "cancelled": "cancelled",
+    "canceled": "cancelled",
+    "expired": "expired",
+    "refunded": "refunded",
+}
+
+
+def parse_iso_datetime(value: Any) -> datetime | None:
+    text = clean_text(value, 100)
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(
+            text.replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def should_sync_payment(payment: dict) -> bool:
+    if PAYMENT_MOCK:
+        return False
+    if payment.get("status") not in {
+        "pending",
+        "processing",
+        "created",
+    }:
+        return False
+    if not payment.get("provider_transaction_id"):
+        return False
+
+    last_checked = parse_iso_datetime(payment.get("last_checked_at"))
+    if not last_checked:
+        return True
+
+    elapsed = (utcnow() - last_checked).total_seconds()
+    return elapsed >= PUSHINPAY_STATUS_SYNC_SECONDS
+
+
+def fetch_pushinpay_transaction(provider_transaction_id: str) -> dict:
     if not PUSHINPAY_TOKEN:
         raise RuntimeError("PUSHINPAY_TOKEN não configurado.")
 
-    transaction_id = clean_text(provider_transaction_id, 160)
-    if not transaction_id:
-        raise RuntimeError("Identificador da transação não informado.")
-
-    url = PUSHINPAY_TRANSACTION_URL.format(id=transaction_id)
+    url = PUSHINPAY_TRANSACTION_URL.format(
+        id=provider_transaction_id
+    )
     response = requests.get(
         url,
         headers={
@@ -368,22 +420,195 @@ def fetch_pushinpay_transaction(provider_transaction_id: str) -> dict:
     except ValueError:
         payload = {"message": response.text[:1000]}
 
+    if response.status_code == 404 or payload == []:
+        raise RuntimeError("Transação não encontrada na PushinPay.")
+
     if response.status_code >= 400:
+        message = None
         if isinstance(payload, dict):
             message = payload.get("message") or payload.get("error")
-        else:
-            message = None
         raise RuntimeError(
-            clean_text(message or "Falha ao consultar a PushinPay.", 500)
+            clean_text(
+                message
+                or f"PushinPay retornou HTTP {response.status_code}.",
+                500,
+            )
         )
 
     if isinstance(payload, list):
         payload = payload[0] if payload else {}
 
-    if not isinstance(payload, dict):
-        raise RuntimeError("Resposta inválida ao consultar a PushinPay.")
+    if not isinstance(payload, dict) or not payload:
+        raise RuntimeError(
+            "A PushinPay retornou uma resposta vazia ou inválida."
+        )
 
     return payload
+
+
+def provider_status(payload: dict) -> str:
+    return clean_text(
+        deep_get(
+            payload,
+            ("status", "payment_status", "paymentStatus", "type"),
+        ),
+        80,
+    ).lower()
+
+
+def validate_provider_transaction(
+    payment: dict,
+    payload: dict,
+) -> None:
+    expected_provider_id = clean_text(
+        payment.get("provider_transaction_id"),
+        160,
+    )
+    received_provider_id = clean_text(
+        deep_get(
+            payload,
+            (
+                "transaction_id",
+                "transactionId",
+                "pix_id",
+                "pixId",
+                "id",
+            ),
+        ),
+        160,
+    )
+
+    if (
+        expected_provider_id
+        and received_provider_id
+        and expected_provider_id != received_provider_id
+    ):
+        raise ValueError(
+            "Identificador da transação não confere."
+        )
+
+    amount_raw = deep_get(
+        payload,
+        ("value", "amount", "amount_cents", "value_cents"),
+    )
+    if amount_raw not in (None, ""):
+        try:
+            raw_number = float(amount_raw)
+            expected = int(payment["amount_cents"])
+            candidates = {
+                int(round(raw_number)),
+                int(round(raw_number * 100)),
+            }
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Valor inválido retornado pela PushinPay."
+            ) from exc
+
+        if expected not in candidates:
+            raise ValueError(
+                "Valor da transação não confere."
+            )
+
+
+def apply_pushinpay_status(
+    payment: dict,
+    payload: dict,
+    *,
+    received_webhook: dict | None = None,
+) -> tuple[dict, dict | None]:
+    validate_provider_transaction(payment, payload)
+
+    raw_status = provider_status(payload)
+    normalized_status = (
+        "paid"
+        if raw_status in PAID_PROVIDER_STATUSES
+        else PROVIDER_STATUS_MAP.get(
+            raw_status,
+            payment["status"],
+        )
+    )
+
+    now_text = iso(utcnow())
+    update: dict[str, Any] = {
+        "last_checked_at": now_text,
+        "last_check_response": payload,
+        "status": normalized_status,
+    }
+
+    if received_webhook is not None:
+        update["webhook_payload"] = {
+            "received": received_webhook,
+            "resolved": payload,
+        }
+
+    if normalized_status == "paid":
+        update["paid_at"] = payment.get("paid_at") or now_text
+
+    result = (
+        supabase.table("payments")
+        .update(update)
+        .eq("id", payment["id"])
+        .execute()
+    )
+    updated_payment = first(result.data) or {
+        **payment,
+        **update,
+    }
+
+    subscription = None
+    if normalized_status == "paid":
+        subscription = activate_subscription(updated_payment)
+        audit_event(
+            updated_payment["user_id"],
+            "subscription_activated",
+            {"payment_id": updated_payment["id"]},
+        )
+
+    return updated_payment, subscription
+
+
+def sync_payment_from_pushinpay(
+    payment: dict,
+    *,
+    force: bool = False,
+    received_webhook: dict | None = None,
+) -> tuple[dict, dict | None, bool]:
+    if PAYMENT_MOCK:
+        return payment, None, False
+
+    if payment.get("status") == "paid":
+        subscription = activate_subscription(payment)
+        return payment, subscription, False
+
+    if not payment.get("provider_transaction_id"):
+        raise RuntimeError(
+            "Pagamento sem identificador da transação na PushinPay."
+        )
+
+    if not force and not should_sync_payment(payment):
+        return payment, None, False
+
+    try:
+        (
+            supabase.table("payments")
+            .update({"last_checked_at": iso(utcnow())})
+            .eq("id", payment["id"])
+            .execute()
+        )
+    except Exception:
+        app.logger.exception(
+            "Não foi possível registrar last_checked_at."
+        )
+
+    payload = fetch_pushinpay_transaction(
+        payment["provider_transaction_id"]
+    )
+    updated_payment, subscription = apply_pushinpay_status(
+        payment,
+        payload,
+        received_webhook=received_webhook,
+    )
+    return updated_payment, subscription, True
 
 
 def audit_event(user_id: str | None, event_type: str, metadata: dict | None = None):
@@ -571,7 +796,13 @@ def root():
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "time": iso(utcnow())})
+    return jsonify(
+        {
+            "ok": True,
+            "time": iso(utcnow()),
+            "version": APP_VERSION,
+        }
+    )
 
 
 @app.get("/plans")
@@ -765,125 +996,181 @@ def create_pix_payment():
 def payment_status(payment_id: str):
     payment = db_one(
         supabase.table("payments")
-        .select("id,plan_id,amount_cents,status,qr_code,copy_paste,expires_at,paid_at,created_at")
+        .select("*")
         .eq("id", payment_id)
         .eq("user_id", g.user["id"])
     )
     if not payment:
         return json_error("Pagamento não encontrado.", 404)
-    return jsonify({"payment": payment, "subscription": current_subscription(g.user["id"])})
+
+    sync_error = None
+    synced = False
+    try:
+        payment, _, synced = sync_payment_from_pushinpay(
+            payment
+        )
+    except Exception as exc:
+        app.logger.exception(exc)
+        sync_error = clean_text(str(exc), 500)
+
+    subscription = current_subscription(g.user["id"])
+    public_payment = {
+        key: payment.get(key)
+        for key in (
+            "id",
+            "plan_id",
+            "amount_cents",
+            "status",
+            "qr_code",
+            "copy_paste",
+            "expires_at",
+            "paid_at",
+            "created_at",
+            "provider_transaction_id",
+            "last_checked_at",
+        )
+    }
+
+    return jsonify(
+        {
+            "payment": public_payment,
+            "subscription": subscription,
+            "provider_synced": synced,
+            "sync_error": sync_error,
+        }
+    )
+
+
+@app.post("/payments/<payment_id>/sync")
+@require_user
+def force_payment_sync(payment_id: str):
+    payment = db_one(
+        supabase.table("payments")
+        .select("*")
+        .eq("id", payment_id)
+        .eq("user_id", g.user["id"])
+    )
+    if not payment:
+        return json_error("Pagamento não encontrado.", 404)
+
+    if (
+        not should_sync_payment(payment)
+        and payment.get("status") != "paid"
+    ):
+        return json_error(
+            "Aguarde pelo menos 60 segundos entre as consultas.",
+            429,
+        )
+
+    try:
+        payment, subscription, synced = (
+            sync_payment_from_pushinpay(
+                payment,
+                force=payment.get("status") != "paid",
+            )
+        )
+    except ValueError as exc:
+        return json_error(str(exc), 409)
+    except Exception as exc:
+        app.logger.exception(exc)
+        return json_error(
+            f"Não foi possível consultar a PushinPay: {exc}",
+            502,
+        )
+
+    return jsonify(
+        {
+            "ok": True,
+            "provider_synced": synced,
+            "payment": {
+                "id": payment.get("id"),
+                "status": payment.get("status"),
+                "paid_at": payment.get("paid_at"),
+                "last_checked_at": payment.get("last_checked_at"),
+            },
+            "subscription": (
+                subscription
+                or current_subscription(g.user["id"])
+            ),
+        }
+    )
 
 
 @app.post("/webhooks/pushinpay")
 def pushinpay_webhook():
     supplied = request.args.get("token", "")
-    if not hmac.compare_digest(supplied, PUSHINPAY_WEBHOOK_TOKEN):
+    if not hmac.compare_digest(
+        supplied,
+        PUSHINPAY_WEBHOOK_TOKEN,
+    ):
         return json_error("Webhook não autorizado.", 401)
 
-    payment_id = clean_text(request.args.get("payment_id"), 80)
+    payment_id = clean_text(
+        request.args.get("payment_id"),
+        80,
+    )
     if not payment_id:
-        return json_error("Webhook sem identificador interno do pagamento.", 400)
+        return json_error(
+            "Webhook sem identificador interno do pagamento.",
+            400,
+        )
 
     payment = db_one(
-        supabase.table("payments").select("*").eq("id", payment_id)
+        supabase.table("payments")
+        .select("*")
+        .eq("id", payment_id)
     )
     if not payment:
         return json_error("Pagamento não localizado.", 404)
 
     received_payload = request.get_json(silent=True) or {}
-    resolved_payload = received_payload
 
-    # A PushinPay pode chamar o webhook sem corpo JSON. Quando isso ocorrer,
-    # consultamos a transação pelo ID salvo no momento da criação do PIX.
-    status_from_body = clean_text(
-        deep_get(
-            received_payload,
-            ("status", "payment_status", "paymentStatus", "type"),
-        ),
-        80,
-    ).lower()
-
-    if not status_from_body:
-        provider_transaction_id = clean_text(
-            payment.get("provider_transaction_id"),
-            160,
+    try:
+        if received_payload and provider_status(
+            received_payload
+        ):
+            updated_payment, subscription = (
+                apply_pushinpay_status(
+                    payment,
+                    received_payload,
+                    received_webhook=received_payload,
+                )
+            )
+            queried_provider = False
+            resolved_payload = received_payload
+        else:
+            (
+                updated_payment,
+                subscription,
+                queried_provider,
+            ) = sync_payment_from_pushinpay(
+                payment,
+                force=True,
+                received_webhook=received_payload,
+            )
+            resolved_payload = (
+                updated_payment.get("last_check_response")
+                or {}
+            )
+    except ValueError as exc:
+        return json_error(str(exc), 409)
+    except Exception as exc:
+        app.logger.exception(exc)
+        return json_error(
+            f"Falha ao reconciliar pagamento: {exc}",
+            502,
         )
-        if not provider_transaction_id:
-            return json_error(
-                "Pagamento sem identificador da transação na PushinPay.",
-                409,
-            )
 
-        try:
-            resolved_payload = fetch_pushinpay_transaction(
-                provider_transaction_id
-            )
-        except (RuntimeError, requests.RequestException) as exc:
-            app.logger.exception(exc)
-            return json_error(
-                f"Não foi possível consultar a transação: {exc}",
-                502,
-            )
-
-    status_raw = clean_text(
-        deep_get(
-            resolved_payload,
-            ("status", "payment_status", "paymentStatus", "type"),
-        ),
-        80,
-    ).lower()
-
-    provider_id = clean_text(
-        deep_get(
-            resolved_payload,
-            ("transaction_id", "transactionId", "pix_id", "pixId", "id"),
-        ),
-        160,
-    )
-    amount_raw = deep_get(
-        resolved_payload,
-        ("value", "amount", "amount_cents", "value_cents"),
-    )
-
-    expected_provider_id = clean_text(
-        payment.get("provider_transaction_id"),
-        160,
-    )
-    if expected_provider_id:
-        if not provider_id and not PAYMENT_MOCK:
-            return json_error(
-                "PushinPay não retornou o identificador da transação.",
-                409,
-            )
-        if provider_id and provider_id != expected_provider_id:
-            return json_error(
-                "Identificador da transação não confere.",
-                409,
-            )
-
-    if amount_raw not in (None, ""):
-        try:
-            raw_number = float(amount_raw)
-            expected = int(payment["amount_cents"])
-            candidates = {
-                int(round(raw_number)),
-                int(round(raw_number * 100)),
-            }
-            if expected not in candidates:
-                return json_error("Valor da transação não confere.", 409)
-        except (TypeError, ValueError):
-            return json_error("Valor inválido na transação.", 400)
-
-    # O hash usa a resposta resolvida. Assim, um webhook vazio antigo não
-    # impede o reprocessamento depois que o status real é consultado.
     event_hash = hashlib.sha256(
         (
             payment_id
             + json.dumps(
-                resolved_payload,
+                {
+                    "received": received_payload,
+                    "resolved": resolved_payload,
+                },
                 sort_keys=True,
                 ensure_ascii=False,
-                separators=(",", ":"),
             )
         ).encode("utf-8")
     ).hexdigest()
@@ -893,84 +1180,6 @@ def pushinpay_webhook():
         .select("id")
         .eq("event_hash", event_hash)
     )
-
-    paid_statuses = {
-        "paid",
-        "approved",
-        "completed",
-        "confirmed",
-        "pix_paid",
-        "payment.paid",
-    }
-    status_map = {
-        "created": "pending",
-        "pending": "pending",
-        "waiting": "pending",
-        "processing": "processing",
-        "failed": "failed",
-        "cancelled": "cancelled",
-        "canceled": "cancelled",
-        "expired": "expired",
-        "refunded": "refunded",
-    }
-
-    if status_raw in paid_statuses:
-        # Atualiza o pagamento, mas sempre confirma também a assinatura.
-        # Isso recupera casos em que o pagamento foi marcado como pago e a
-        # ativação falhou antes de concluir.
-        if payment.get("status") != "paid" or not payment.get("paid_at"):
-            supabase.table("payments").update(
-                {
-                    "status": "paid",
-                    "paid_at": payment.get("paid_at") or iso(utcnow()),
-                    "webhook_payload": {
-                        "received": received_payload,
-                        "resolved": resolved_payload,
-                    },
-                }
-            ).eq("id", payment["id"]).execute()
-
-        payment["status"] = "paid"
-        subscription = activate_subscription(payment)
-
-        if not prior:
-            supabase.table("webhook_events").insert(
-                {
-                    "provider": "pushinpay",
-                    "event_hash": event_hash,
-                    "payload": {
-                        "received": received_payload,
-                        "resolved": resolved_payload,
-                    },
-                    "created_at": iso(utcnow()),
-                }
-            ).execute()
-
-        audit_event(
-            payment["user_id"],
-            "subscription_activated",
-            {"payment_id": payment["id"]},
-        )
-        return jsonify(
-            {
-                "ok": True,
-                "activated": True,
-                "duplicate": bool(prior),
-                "subscription_id": subscription.get("id"),
-            }
-        )
-
-    safe_status = status_map.get(status_raw, payment["status"])
-    supabase.table("payments").update(
-        {
-            "webhook_payload": {
-                "received": received_payload,
-                "resolved": resolved_payload,
-            },
-            "status": safe_status,
-        }
-    ).eq("id", payment["id"]).execute()
-
     if not prior:
         supabase.table("webhook_events").insert(
             {
@@ -987,9 +1196,15 @@ def pushinpay_webhook():
     return jsonify(
         {
             "ok": True,
-            "duplicate": bool(prior),
-            "status": safe_status,
-            "provider_status": status_raw or None,
+            "status": updated_payment.get("status"),
+            "activated": bool(subscription),
+            "subscription_id": (
+                subscription.get("id")
+                if subscription
+                else None
+            ),
+            "queried_provider": queried_provider,
+            "duplicate_event": bool(prior),
         }
     )
 
