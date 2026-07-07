@@ -40,14 +40,14 @@ PUSHINPAY_CASHIN_URL = env(
 )
 PUSHINPAY_TRANSACTION_URL = env(
     "PUSHINPAY_TRANSACTION_URL",
-    "https://api.pushinpay.com.br/api/transactions/{id}",
+    "https://api.pushinpay.com.br/api/transaction/{id}",
 )
 PUSHINPAY_STATUS_SYNC_SECONDS = max(
     int(env("PUSHINPAY_STATUS_SYNC_SECONDS", "60")),
     60,
 )
 PUSHINPAY_WEBHOOK_TOKEN = env("PUSHINPAY_WEBHOOK_TOKEN", required=True)
-APP_VERSION = "2026-07-07-pushinpay-sync-v3"
+APP_VERSION = "2026-07-07-pushinpay-sync-v3.1"
 STREAM_SIGNING_SECRET = env("STREAM_SIGNING_SECRET", required=True)
 LICENSED_STREAM_BASE_URL = env("LICENSED_STREAM_BASE_URL", "https://stream.example.com/watch").rstrip("/")
 TRIAL_DURATION_MINUTES = int(env("TRIAL_DURATION_MINUTES", "60"))
