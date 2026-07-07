@@ -40,6 +40,10 @@ PUSHINPAY_CASHIN_URL = env(
 )
 PUSHINPAY_TRANSACTION_URL = env(
     "PUSHINPAY_TRANSACTION_URL",
+    "https://api.pushinpay.com.br/api/transactions/{id}",
+)
+PUSHINPAY_TRANSACTION_FALLBACK_URL = env(
+    "PUSHINPAY_TRANSACTION_FALLBACK_URL",
     "https://api.pushinpay.com.br/api/transaction/{id}",
 )
 PUSHINPAY_STATUS_SYNC_SECONDS = max(
@@ -47,7 +51,7 @@ PUSHINPAY_STATUS_SYNC_SECONDS = max(
     60,
 )
 PUSHINPAY_WEBHOOK_TOKEN = env("PUSHINPAY_WEBHOOK_TOKEN", required=True)
-APP_VERSION = "2026-07-07-pushinpay-sync-v3.1"
+APP_VERSION = "2026-07-07-pushinpay-sync-v3.2"
 STREAM_SIGNING_SECRET = env("STREAM_SIGNING_SECRET", required=True)
 LICENSED_STREAM_BASE_URL = env("LICENSED_STREAM_BASE_URL", "https://stream.example.com/watch").rstrip("/")
 TRIAL_DURATION_MINUTES = int(env("TRIAL_DURATION_MINUTES", "60"))
@@ -398,52 +402,75 @@ def should_sync_payment(payment: dict) -> bool:
     return elapsed >= PUSHINPAY_STATUS_SYNC_SECONDS
 
 
-def fetch_pushinpay_transaction(provider_transaction_id: str) -> dict:
+def fetch_pushinpay_transaction(
+    provider_transaction_id: str,
+) -> dict:
+    """Consulta a transação tentando os dois formatos de endpoint conhecidos."""
     if not PUSHINPAY_TOKEN:
         raise RuntimeError("PUSHINPAY_TOKEN não configurado.")
 
-    url = PUSHINPAY_TRANSACTION_URL.format(
-        id=provider_transaction_id
-    )
-    response = requests.get(
-        url,
-        headers={
-            "Authorization": f"Bearer {PUSHINPAY_TOKEN}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        },
-        timeout=25,
-    )
+    headers = {
+        "Authorization": f"Bearer {PUSHINPAY_TOKEN}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
 
-    try:
-        payload = response.json()
-    except ValueError:
-        payload = {"message": response.text[:1000]}
+    templates: list[str] = []
+    for template in (
+        PUSHINPAY_TRANSACTION_URL,
+        PUSHINPAY_TRANSACTION_FALLBACK_URL,
+    ):
+        template = clean_text(template, 500)
+        if template and template not in templates:
+            templates.append(template)
 
-    if response.status_code == 404 or payload == []:
-        raise RuntimeError("Transação não encontrada na PushinPay.")
+    attempts: list[dict[str, Any]] = []
 
-    if response.status_code >= 400:
-        message = None
-        if isinstance(payload, dict):
-            message = payload.get("message") or payload.get("error")
-        raise RuntimeError(
-            clean_text(
-                message
-                or f"PushinPay retornou HTTP {response.status_code}.",
-                500,
+    for template in templates:
+        url = template.format(id=provider_transaction_id)
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=25,
             )
+        except requests.RequestException as exc:
+            attempts.append(
+                {
+                    "url": url,
+                    "network_error": clean_text(str(exc), 1000),
+                }
+            )
+            continue
+
+        raw_text = response.text[:3000]
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+
+        attempts.append(
+            {
+                "url": url,
+                "status_code": response.status_code,
+                "response": payload if payload is not None else raw_text,
+            }
         )
 
-    if isinstance(payload, list):
-        payload = payload[0] if payload else {}
+        if response.status_code >= 400:
+            continue
 
-    if not isinstance(payload, dict) or not payload:
-        raise RuntimeError(
-            "A PushinPay retornou uma resposta vazia ou inválida."
-        )
+        if isinstance(payload, list):
+            payload = payload[0] if payload else None
 
-    return payload
+        if isinstance(payload, dict) and payload:
+            payload["_query_endpoint"] = url
+            return payload
+
+    raise RuntimeError(
+        "Falha ao consultar a transação na PushinPay. "
+        + json.dumps(attempts, ensure_ascii=False)
+    )
 
 
 def provider_status(payload: dict) -> str:
@@ -600,9 +627,37 @@ def sync_payment_from_pushinpay(
             "Não foi possível registrar last_checked_at."
         )
 
-    payload = fetch_pushinpay_transaction(
-        payment["provider_transaction_id"]
-    )
+    try:
+        payload = fetch_pushinpay_transaction(
+            payment["provider_transaction_id"]
+        )
+    except Exception as exc:
+        diagnostic = {
+            "ok": False,
+            "error": clean_text(str(exc), 12000),
+            "checked_at": iso(utcnow()),
+            "provider_transaction_id": payment.get(
+                "provider_transaction_id"
+            ),
+        }
+        try:
+            (
+                supabase.table("payments")
+                .update(
+                    {
+                        "last_checked_at": diagnostic["checked_at"],
+                        "last_check_response": diagnostic,
+                    }
+                )
+                .eq("id", payment["id"])
+                .execute()
+            )
+        except Exception:
+            app.logger.exception(
+                "Falha ao salvar diagnóstico da PushinPay."
+            )
+        raise
+
     updated_payment, subscription = apply_pushinpay_status(
         payment,
         payload,
